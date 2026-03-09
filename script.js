@@ -1,4 +1,4 @@
-var MODEL_URL = './lama_fp32.onnx';
+var MODEL_URL = 'https://github.com/nezumi-sketch/nezumi-inpaint/releases/download/%E3%83%A2%E3%83%87%E3%83%AB/lama_fp16.onnx';
 var IMG_SIZE  = 512;
 var lastEP    = 'unknown';
 var preferWebGPU = true;
