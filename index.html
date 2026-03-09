@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LaMa Inpaint — nezumi-</title>
+<link rel="icon" href="https://mouse-sketch.web.app/img/nezumi-drawing_icon.webp" type="image/webp">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Noto+Sans+JP:wght@300;400;700&display=swap');
+  :root {
+    --bg:#0e0e10; --surface:#18181c; --border:#2a2a30;
+    --accent:#00e5a0; --accent2:#ff4f7b;
+    --text:#e8e8ec; --muted:#555560; --radius:6px;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:'Noto Sans JP',sans-serif; font-weight:300; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px; gap:20px; }
+  header { display:flex; align-items:baseline; gap:16px; align-self:flex-start; max-width:820px; width:100%; }
+  h1 { font-family:'Space Mono',monospace; font-size:14px; color:var(--accent); letter-spacing:.12em; text-transform:uppercase; }
+  .sub { font-size:11px; color:var(--muted); font-family:'Space Mono',monospace; }
+  .workspace { width:100%; max-width:820px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+  .canvas-wrap {
+    position:relative; width:100%; aspect-ratio:16/9; overflow:hidden;
+    background:linear-gradient(45deg,#1a1a1e 25%,transparent 25%) -10px 0,
+               linear-gradient(-45deg,#1a1a1e 25%,transparent 25%) -10px 0,
+               linear-gradient(45deg,transparent 75%,#1a1a1e 75%),
+               linear-gradient(-45deg,transparent 75%,#1a1a1e 75%);
+    background-size:20px 20px; background-color:#141416;
+  }
+  canvas { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }
+  #maskCanvas { opacity:.6; }
+  #pointerLayer { position:absolute; inset:0; cursor:crosshair; z-index:5; }
+  #dropOverlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; z-index:10; cursor:pointer; }
+  #dropOverlay.hidden { display:none; }
+  .drop-icon { font-size:36px; opacity:.22; }
+  .drop-text { font-size:12px; color:var(--muted); font-family:'Space Mono',monospace; }
+  .toolbar { display:flex; align-items:center; gap:10px; padding:10px 14px; border-top:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
+  .tool-group { display:flex; align-items:center; gap:7px; }
+  .lbl { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; white-space:nowrap; }
+  input[type=range] { -webkit-appearance:none; appearance:none; width:80px; height:3px; background:var(--border); border-radius:2px; outline:none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:12px; height:12px; background:var(--accent); border-radius:50%; cursor:pointer; }
+  .val { font-family:'Space Mono',monospace; font-size:11px; color:var(--text); width:22px; text-align:right; }
+  button { font-family:'Space Mono',monospace; font-size:11px; letter-spacing:.06em; text-transform:uppercase; padding:6px 12px; border-radius:var(--radius); border:1px solid var(--border); background:var(--surface); color:var(--text); cursor:pointer; transition:border-color .12s,color .12s; white-space:nowrap; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  button:active { opacity:.75; }
+  button.primary { background:var(--accent); color:#000; border-color:var(--accent); font-weight:700; }
+  button.primary:hover { background:#00ffb3; border-color:#00ffb3; color:#000; }
+  button.primary:disabled { background:var(--border); color:var(--muted); border-color:var(--border); cursor:not-allowed; }
+  .mode-btn { padding:5px 10px; font-size:10px; }
+  .mode-btn.active { background:var(--accent); color:#000; border-color:var(--accent); font-weight:700; }
+  .sep { width:1px; height:22px; background:var(--border); }
+  .spacer { flex:1; }
+  .progress-wrap { padding:0 14px 10px; background:var(--bg); display:none; }
+  .progress-wrap.visible { display:block; }
+  .progress-bar-bg { background:var(--border); border-radius:3px; height:4px; overflow:hidden; }
+  .progress-bar-fill { height:100%; background:var(--accent); border-radius:3px; width:0%; transition:width .3s; }
+  .progress-label { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); margin-top:5px; }
+  .status { font-family:'Space Mono',monospace; font-size:10px; padding:6px 14px; color:var(--muted); border-top:1px solid var(--border); background:var(--bg); min-height:26px; display:flex; align-items:center; gap:8px; }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .dot.ok { background:var(--accent); }
+  .dot.busy { background:#f0a500; animation:blink .8s ease-in-out infinite; }
+  .dot.err { background:var(--accent2); }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+  /* brand */
+  .brand { display:flex; align-items:center; gap:10px; align-self:flex-start; max-width:820px; width:100%; margin-bottom:-6px; }
+  .brand-logo { height:22px; width:auto; opacity:.85; filter:invert(1); }
+  .brand-icon { height:28px; width:auto; }
+  footer { width:100%; max-width:820px; padding:10px 0 4px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:5px; }
+  .credits-title { font-family:'Space Mono',monospace; font-size:9px; color:var(--muted); letter-spacing:.12em; text-transform:uppercase; opacity:.5; margin-bottom:2px; }
+  .credit { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); display:flex; align-items:center; flex-wrap:wrap; }
+  .credit a { color:var(--text); opacity:.5; text-decoration:none; transition:color .12s,opacity .12s; }
+  .credit a:hover { color:var(--accent); opacity:1; }
+  .credit-tag { font-size:9px; margin-left:5px; padding:1px 5px; border:1px solid var(--border); border-radius:3px; letter-spacing:.06em; opacity:.5; }
+  .credit-sep { padding:0 8px; color:var(--border); }
+</style>
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+</head>
+<body>
+<a href="https://mouse-sketch.web.app/" target="_blank" rel="noopener" class="brand" style="text-decoration:none;">
+  <img class="brand-icon" src="https://mouse-sketch.web.app/img/nezumi-drawing_icon.webp" alt="ネズミスケッチ アイコン">
+  <img class="brand-logo" src="https://mouse-sketch.web.app/img/nezumisuketitext.png" alt="ネズミスケッチ">
+  <P>Lab</P>
+</a>
+<header>
+  <h1>LaMa inpaint-ネズミラボ</h1>
+  <span class="sub">onnxruntime-web · Web Worker · IndexedDB cache-ラボ</span>
+</header>
+<div class="workspace">
+  <div class="canvas-wrap" id="canvasWrap">
+    <canvas id="imageCanvas"></canvas>
+    <canvas id="maskCanvas"></canvas>
+    <canvas id="cursorCanvas"></canvas>
+    <div id="pointerLayer"></div>
+    <div id="dropOverlay">
+      <div class="drop-icon">🖼</div>
+      <div class="drop-text">ここをクリック、または画像をドロップ</div>
+    </div>
+  </div>
+  <div class="toolbar">
+    <div class="tool-group">
+      <span class="lbl">mode</span>
+      <button class="mode-btn active" id="btnMask">mask</button>
+      <button class="mode-btn" id="btnErase">erase</button>
+    </div>
+    <div class="sep"></div>
+    <div class="tool-group">
+      <span class="lbl">size</span>
+      <input type="range" id="brushSize" min="4" max="120" value="32">
+      <span class="val" id="sizeVal">32</span>
+    </div>
+    <div class="spacer"></div>
+    <button id="btnOpen">open</button>
+    <div class="sep"></div>
+    <button id="btnSave">save</button>
+    <div class="sep"></div>
+    <button id="btnClearMask">clear</button>
+    <button id="btnUndo">undo</button>
+    <button class="primary" id="btnRun" disabled>実行</button>
+  </div>
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
+    <div class="progress-label" id="progressLabel"></div>
+  </div>
+  <div class="status">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">初期化中…</span>
+  </div>
+</div>
+<footer>
+  <div class="credits-title">credits</div>
+  <div class="credit">
+    <a href="https://github.com/saic-mdal/lama" target="_blank" rel="noopener">LaMa</a>
+    <span class="credit-tag">Apache-2.0</span>
+    <span class="credit-sep">·</span>
+    Resolution-robust Large Mask Inpainting — Suvorov et al., Samsung Research
+  </div>
+  <div class="credit">
+    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+    <span class="credit-tag">MIT</span>
+    <span class="credit-sep">·</span>
+    Microsoft
+  </div>
+  <div class="credit">
+    <a href="https://fonts.google.com/specimen/Space+Mono" target="_blank" rel="noopener">Space Mono</a>
+    <span class="credit-tag">OFL</span>
+    <span class="credit-sep">·</span>
+    <a href="https://fonts.google.com/noto/specimen/Noto+Sans+JP" target="_blank" rel="noopener">Noto Sans JP</a>
+    <span class="credit-tag">OFL</span>
+    <span class="credit-sep">·</span>
+    Google Fonts
+  </div>
+</footer>
+<input type="file" id="fileInput" accept="image/*" style="position:fixed;top:-9999px;left:-9999px;opacity:0;">
+
+<!-- ============================================================
+     Web Worker source — inlined as Blob
+     ============================================================ -->
+<script id="workerSrc" type="text/plain">
+var ORT_CDN = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js';
+var DB_NAME    = 'lama-cache';
+var DB_VERSION = 1;
+var STORE_NAME = 'models';
+var MODEL_KEY  = 'lama_fp32';
+var IMG_SIZE   = 512;
+var ortSession = null;
+var activeEP   = 'wasm';
+
+function openDB() {
+  return new Promise(function(res, rej) {
+    var r = indexedDB.open(DB_NAME, DB_VERSION);
+    r.onupgradeneeded = function(e){ e.target.result.createObjectStore(STORE_NAME); };
+    r.onsuccess = function(e){ res(e.target.result); };
+    r.onerror   = function(e){ rej(e.target.error); };
+  });
+}
+function dbGet(db, key) {
+  return new Promise(function(res, rej) {
+    var r = db.transaction(STORE_NAME,'readonly').objectStore(STORE_NAME).get(key);
+    r.onsuccess = function(e){ res(e.target.result); };
+    r.onerror   = function(e){ rej(e.target.error); };
+  });
+}
+function dbPut(db, key, val) {
+  return new Promise(function(res, rej) {
+    var r = db.transaction(STORE_NAME,'readwrite').objectStore(STORE_NAME).put(val, key);
+    r.onsuccess = function(){ res(); };
+    r.onerror   = function(e){ rej(e.target.error); };
+  });
+}
+function downloadModel(url) {
+  return new Promise(function(res, rej) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.responseType = 'arraybuffer';
+    xhr.onprogress = function(e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        var mb  = (e.loaded/1024/1024).toFixed(1);
+        var tot = (e.total /1024/1024).toFixed(0);
+        postMessage({ type:'progress', pct:pct, label:'ダウンロード中… '+mb+' / '+tot+' MB ('+pct+'%)' });
+      }
+    };
+    xhr.onload  = function(){ xhr.status===200 ? res(xhr.response) : rej(new Error('HTTP '+xhr.status)); };
+    xhr.onerror = function(){ rej(new Error('network error')); };
+    xhr.send();
+  });
+}
+
+self.onmessage = async function(e) {
+  var msg = e.data;
+
+  if (msg.type === 'init') {
+    try {
+      postMessage({ type:'status', state:'busy', text:'onnxruntime-web 読み込み中…' });
+      importScripts(ORT_CDN);
+      // configure the wasm backend before creating a session
+      // when the worker is started from a blob URL, relative paths
+      // cannot be resolved correctly, so explicitly point to the CDN
+      ort.env.wasm.wasmPaths = {
+        'ort-wasm.wasm': 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm.wasm',
+        'ort-wasm-simd.wasm': 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm-simd.wasm',
+        'ort-wasm-threaded.wasm': 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm-threaded.wasm',
+        'ort-wasm-simd-threaded.wasm': 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm-simd-threaded.wasm'
+      };
+      ort.env.wasm.numThreads = msg.threads || 2;
+      ort.env.wasm.simd       = true;
+
+      postMessage({ type:'status', state:'busy', text:'キャッシュを確認中…' });
+      var db     = await openDB();
+      var cached = await dbGet(db, MODEL_KEY);
+      var buf;
+
+      if (cached) {
+        postMessage({ type:'status', state:'busy', text:'キャッシュから読み込み中…' });
+        buf = cached;
+      } else {
+        postMessage({ type:'status', state:'busy', text:'モデルをダウンロード中… (208 MB)' });
+        buf = await downloadModel(msg.modelUrl);
+        postMessage({ type:'status', state:'busy', text:'キャッシュに保存中…' });
+        try { await dbPut(db, MODEL_KEY, buf); } catch(ex) { console.warn('cache save failed', ex); }
+      }
+
+      postMessage({ type:'status', state:'busy', text:'セッション作成中…' });
+      var hasWebGPU = !!(self.navigator && navigator.gpu);
+      var wantWebGPU = !!msg.preferWebGPU && hasWebGPU;
+      var providers = wantWebGPU ? ['webgpu', 'wasm'] : ['wasm'];
+      try {
+        ortSession = await ort.InferenceSession.create(buf, { executionProviders: providers });
+      } catch (epErr) {
+        // Fallback when WebGPU init fails on some environments.
+        ortSession = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+        providers = ['wasm'];
+      }
+      activeEP = providers[0];
+      postMessage({ type:'ready', ep: activeEP, hasWebGPU: hasWebGPU });
+
+    } catch(err) {
+      postMessage({ type:'error', text: err.message });
+    }
+  }
+
+  if (msg.type === 'run') {
+    try {
+      postMessage({ type:'status', state:'busy', text:'LaMa 推論中… (' + activeEP + ')' });
+      var t0 = performance.now();
+
+      var imgArr  = msg.imgArr;   // Float32Array [3*512*512]
+      var maskArr = msg.maskArr;  // Float32Array [512*512]
+
+      var imgTensor  = new ort.Tensor('float32', imgArr,  [1,3,IMG_SIZE,IMG_SIZE]);
+      var maskTensor = new ort.Tensor('float32', maskArr, [1,1,IMG_SIZE,IMG_SIZE]);
+
+      var output  = await ortSession.run({ image: imgTensor, mask: maskTensor });
+      var keys    = Object.keys(output);
+      var outKey  = null;
+      for (var i = 0; i < keys.length; i++) {
+        var t = output[keys[i]];
+        if (t && t.dims && t.dims.length === 4 && t.dims[1] === 3) { outKey = keys[i]; break; }
+      }
+      if (!outKey) {
+        outKey = keys[0];
+      }
+      var outTensor = output[outKey];
+      var outData   = outTensor.data; // Float32Array
+      var dims      = outTensor.dims || [1,3,IMG_SIZE,IMG_SIZE];
+
+      // Auto-detect output value range:
+      // [-1,1] -> (v+1)/2, [0,1] -> keep, [0,255] -> v/255.
+      var sampleMin = Infinity;
+      var sampleMax = -Infinity;
+      var sampleN   = Math.min(outData.length, 4096);
+      for (var s = 0; s < sampleN; s++) {
+        var v = outData[s];
+        if (v < sampleMin) sampleMin = v;
+        if (v > sampleMax) sampleMax = v;
+      }
+      var needsSignedMap = sampleMin < -0.01;
+      var needs255Map    = !needsSignedMap && sampleMax > 1.5;
+
+      // float32 tensor -> RGBA uint8 (supports NCHW/NHWC)
+      var n    = IMG_SIZE * IMG_SIZE;
+      var rgba = new Uint8ClampedArray(n * 4);
+      var isNCHW = (dims[1] === 3);
+      for (var j = 0; j < n; j++) {
+        var r, g, b;
+        if (isNCHW) {
+          r = outData[0*n+j];
+          g = outData[1*n+j];
+          b = outData[2*n+j];
+        } else {
+          var base = j * 3;
+          r = outData[base + 0];
+          g = outData[base + 1];
+          b = outData[base + 2];
+        }
+        if (needsSignedMap) {
+          r = (r + 1) * 0.5;
+          g = (g + 1) * 0.5;
+          b = (b + 1) * 0.5;
+        } else if (needs255Map) {
+          r = r / 255;
+          g = g / 255;
+          b = b / 255;
+        }
+        rgba[j*4+0] = Math.round(Math.min(1,Math.max(0,r))*255);
+        rgba[j*4+1] = Math.round(Math.min(1,Math.max(0,g))*255);
+        rgba[j*4+2] = Math.round(Math.min(1,Math.max(0,b))*255);
+        rgba[j*4+3] = 255;
+      }
+      var elapsedMs = performance.now() - t0;
+      postMessage({ type:'result', rgba: rgba, ep: activeEP, elapsedMs: elapsedMs }, [rgba.buffer]);
+
+    } catch(err) {
+      postMessage({ type:'error', text: err.message });
+    }
+  }
+};
+</script>
+<script>
+// save button
+document.getElementById('btnSave').addEventListener('click', function() {
+  var c = document.getElementById('imageCanvas');
+  if (!c.width) return;
+  var a = document.createElement('a');
+  a.download = 'lama-inpaint.png';
+  a.href = c.toDataURL('image/png');
+  a.click();
+});
+</script>
+<script src="script.js"></script>
+</body>
+</html>
