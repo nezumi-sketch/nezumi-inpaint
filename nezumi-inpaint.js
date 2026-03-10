@@ -7,11 +7,17 @@
  *     container: '#canvasWrap',   // CSS selector or HTMLElement
  *     workerSrc: '...',           // worker script source string (or omit to use bundled)
  *     modelUrl:  '...',           // ONNX model URL (optional, defaults to GitHub release)
- *     imgSize:   512,             // inference resolution: 256 / 512 / 768 / 1024
+ *     imgSize:   256,             // base inference resolution: 128 / 256 / 512 / 768 / 1024
  *     dtype:     'float32',       // 'float32' (default) | 'float16' (half transfer size)
+ *     roi:       true,            // enable ROI crop (mask bbox + padding)
+ *     roiPad:    128,             // ROI padding in pixels
+ *     roiMinSize:256,             // minimum ROI inference size
+ *     roiMaxSize:512,             // maximum ROI inference size
+ *     profile:   false,           // enable timing breakdowns
+ *     onProfile: ({ totalMs, inferMs, prepMs, size, roi }) => {},
  *     onStatus:  ({ state, text }) => {},
  *     onProgress: ({ pct, label }) => {},
- *     onResult:  ({ elapsedMs, ep }) => {},
+ *     onResult:  ({ elapsedMs, ep, profile }) => {},
  *     onError:   (message) => {},
  *   });
  *
@@ -44,12 +50,12 @@
   var DEFAULT_MODEL_URL_FP16 =
     'https://huggingface.co/datasets/Mouserat/nezumi-models/resolve/main/lama_fp16.onnx';
 
-  var DEFAULT_IMG_SIZE = 512;
+  var DEFAULT_IMG_SIZE = 256;
   var MAX_WIDTH        = 1280;
   var MAX_HEIGHT       = 720;
 
   /** Valid inference sizes. LaMa was trained on 512; other powers-of-two may work. */
-  var VALID_IMG_SIZES = [256, 512, 768, 1024];
+  var VALID_IMG_SIZES = [128, 256, 512, 768, 1024];
   var UNDO_LIMIT  = 20;
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -62,6 +68,16 @@
   }
 
   function noop() {}
+
+  function pickSizeCeil(target, minSize, maxSize) {
+    var size = maxSize;
+    for (var i = 0; i < VALID_IMG_SIZES.length; i++) {
+      var s = VALID_IMG_SIZES[i];
+      if (s >= target) { size = s; break; }
+    }
+    size = clamp(size, minSize, maxSize);
+    return size;
+  }
 
   // ─── Float16 utilities ────────────────────────────────────────────────────
   // Pure-JS IEEE 754 fp32 → fp16 packing (no native Float16Array required).
@@ -153,10 +169,16 @@
    * @param {string}  [opts.modelUrl]
    * @param {number}  [opts.brushSize=24]
    * @param {number}  [opts.undoLimit=20]
-   * @param {number}  [opts.imgSize=512]  Inference resolution. Snapped to nearest of 256/512/768/1024.
+   * @param {number}  [opts.imgSize=256]  Base inference resolution. Snapped to nearest of 128/256/512/768/1024.
    * @param {'float32'|'float16'} [opts.dtype='float32']  Tensor dtype sent to the worker.
    *   'float16' halves transfer size but requires the worker/model to accept fp16 input.
    *   Falls back to float32 automatically if Float16Array / encodeFloat16 is unavailable.
+   * @param {boolean} [opts.roi=true]      Enable ROI crop based on mask bbox.
+   * @param {number}  [opts.roiPad=128]    ROI padding in pixels.
+   * @param {number}  [opts.roiMinSize=256] Minimum ROI inference size.
+   * @param {number}  [opts.roiMaxSize=imgSize] Maximum ROI inference size.
+   * @param {boolean} [opts.profile=false] Enable timing breakdowns for debugging.
+   * @param {function} [opts.onProfile]    Receives timing details per run.
    * @param {boolean} [opts.preferWebGPU=true]
    * @param {function} [opts.onStatus]
    * @param {function} [opts.onProgress]
@@ -187,6 +209,15 @@
     // modelUrl: always fp32 model — dtype:'float16' affects transfer only, not the model
     this._modelUrl = opts.modelUrl || DEFAULT_MODEL_URL;
 
+    // ROI / profiling
+    this._roiEnabled  = !!opts.roi;
+    this._roiPad      = clamp(opts.roiPad || 128, 0, 512);
+    this._roiMinSize  = clamp(opts.roiMinSize || 256, 64, 1024);
+    this._roiMaxSize  = clamp(opts.roiMaxSize || this._imgSize, 64, 1024);
+    if (this._roiMinSize > this._roiMaxSize) this._roiMinSize = this._roiMaxSize;
+    this._profileOn   = !!opts.profile;
+    this._onProfile   = opts.onProfile || noop;
+
     // ── Callbacks ────────────────────────────────────────────────────────────
     this._onStatus   = opts.onStatus   || noop;
     this._onProgress = opts.onProgress || noop;
@@ -203,6 +234,8 @@
     this._cachedImgArr = null;
     this._pendingResolve = null;
     this._pendingReject  = null;
+    this._lastRunInfo    = null;
+    this._lastProfile    = null;
 
     // ── DOM / Canvases ───────────────────────────────────────────────────────
     this._container  = resolveElement(opts.container);
@@ -378,7 +411,7 @@
 
   NezumiInpaint.prototype._rebuildImageCache = function () {
     if (!this._imageLoaded) return;
-    var S   = this._imgSize;
+    var S   = (this._lastRunInfo && this._lastRunInfo.size) || this._imgSize;
     var ctx = this._imgSmallCtx;
     ctx.imageSmoothingEnabled = true;
     ctx.clearRect(0, 0, S, S);
@@ -398,6 +431,33 @@
     // Always cache as Float32Array.
     // dtype:'float16' affects transfer encoding in run(), not the cache itself.
     this._cachedImgArr = f32;
+  };
+
+  NezumiInpaint.prototype._ensureScratchSize = function (S) {
+    if (this._imgSmall.width !== S || this._imgSmall.height !== S) {
+      this._imgSmall.width  = this._maskSmall.width  = S;
+      this._imgSmall.height = this._maskSmall.height = S;
+    }
+  };
+
+  NezumiInpaint.prototype._computeMaskBounds = function () {
+    var W = this._maskCanvas.width;
+    var H = this._maskCanvas.height;
+    var data = this._maskCtx.getImageData(0, 0, W, H).data;
+    var minX = W, minY = H, maxX = -1, maxY = -1;
+    for (var y = 0; y < H; y++) {
+      var row = y * W * 4;
+      for (var x = 0; x < W; x++) {
+        if (data[row + x * 4 + 3] > 10) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null;
+    return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
   };
 
   // ── Worker ───────────────────────────────────────────────────────────────
@@ -451,6 +511,8 @@
         case 'error':
           self._onStatus({ state: 'err', text: 'Error: ' + msg.text });
           self._onError(msg.text);
+          self._lastProfile = null;
+          self._lastRunInfo = null;
           if (self._undoStack.length) {
             self._imgCtx.putImageData(self._undoStack.pop(), 0, 0);
             self._rebuildImageCache();
@@ -470,6 +532,7 @@
     this._worker.postMessage({
       type:         'init',
       modelUrl:     this._modelUrl,
+      imgSize:      this._imgSize,
       threads:      navigator.hardwareConcurrency || 2,
       preferWebGPU: !!preferGPU
     });
@@ -567,7 +630,12 @@
     var tmp = document.createElement('canvas');
     tmp.width = S; tmp.height = S;
     tmp.getContext('2d').putImageData(new ImageData(rgba, S, S), 0, 0);
-    this._imgCtx.drawImage(tmp, 0, 0, W, H);
+    if (this._lastRunInfo && this._lastRunInfo.roiRect) {
+      var r = this._lastRunInfo.roiRect;
+      this._imgCtx.drawImage(tmp, 0, 0, S, S, r.x, r.y, r.w, r.h);
+    } else {
+      this._imgCtx.drawImage(tmp, 0, 0, W, H);
+    }
     this._rebuildImageCache();
     this._maskCtx.clearRect(0, 0, W, H);
 
@@ -575,7 +643,15 @@
     var elapsed = typeof msg.elapsedMs === 'number' ? msg.elapsedMs.toFixed(1) : '?';
     this._lastEP = ep;
     this._onStatus({ state: 'ok', text: 'Done (' + ep + ', ' + elapsed + ' ms)' });
-    this._onResult({ elapsedMs: msg.elapsedMs, ep: ep });
+    if (this._lastProfile) {
+      this._lastProfile.totalMs = performance.now() - this._lastProfile.t0;
+      this._lastProfile.inferMs = typeof msg.elapsedMs === 'number' ? msg.elapsedMs : null;
+      if (typeof msg.elapsedMs === 'number') {
+        this._lastProfile.overheadMs = Math.max(0, this._lastProfile.totalMs - msg.elapsedMs);
+      }
+      if (this._profileOn) this._onProfile(this._lastProfile);
+    }
+    this._onResult({ elapsedMs: msg.elapsedMs, ep: ep, profile: this._lastProfile });
 
     // Auto-fallback: WebGPU too slow → switch to WASM
     if (ep === 'webgpu' && typeof msg.elapsedMs === 'number' && msg.elapsedMs > 15000 && this._preferWebGPU) {
@@ -651,27 +727,80 @@
     if (!this._workerReady) return Promise.reject(new Error('Model not ready'));
     if (!this._imageLoaded) return Promise.reject(new Error('No image loaded'));
 
-    // Build mask tensor (always fp32 first; convert if needed)
-    var S = this._imgSize;
-    var n = S * S;
-    if (!this._cachedImgArr) this._rebuildImageCache();
-    var imgArr = this._cachedImgArr.slice();  // detach for zero-copy transfer
+    var profile = this._profileOn ? { t0: performance.now() } : null;
 
-    var mCtx = this._maskSmallCtx;
-    mCtx.imageSmoothingEnabled = false;
-    mCtx.clearRect(0, 0, S, S);
-    mCtx.drawImage(this._maskCanvas, 0, 0, S, S);
-    var mData = mCtx.getImageData(0, 0, S, S).data;
-
-    var maskF32 = new Float32Array(n);
-    var ones = 0;
-    for (var j = 0; j < n; j++) {
-      var v = mData[j * 4 + 3] > 10 ? 1.0 : 0.0;
-      maskF32[j] = v;
-      if (v) ones++;
+    // Compute ROI from full-res mask
+    var W = this._imgCanvas.width;
+    var H = this._imgCanvas.height;
+    var roiRect = null;
+    if (this._roiEnabled) {
+      var bounds = this._computeMaskBounds();
+      if (!bounds) return Promise.reject(new Error('Mask is empty — draw on the image first'));
+      var pad = this._roiPad;
+      var x0 = clamp(bounds.minX - pad, 0, W - 1);
+      var y0 = clamp(bounds.minY - pad, 0, H - 1);
+      var x1 = clamp(bounds.maxX + pad, 0, W - 1);
+      var y1 = clamp(bounds.maxY + pad, 0, H - 1);
+      roiRect = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
     }
 
-    if (!ones) return Promise.reject(new Error('Mask is empty — draw on the image first'));
+    if (profile) profile.maskMs = performance.now() - profile.t0;
+
+    // Build tensors (always fp32 first; convert if needed)
+    var S;
+    if (roiRect) {
+      S = pickSizeCeil(Math.max(roiRect.w, roiRect.h), this._roiMinSize, this._roiMaxSize);
+    } else {
+      S = this._imgSize;
+    }
+    this._ensureScratchSize(S);
+
+    var n = S * S;
+    var imgArr;
+    var maskF32;
+
+    if (roiRect) {
+      var iCtx = this._imgSmallCtx;
+      iCtx.imageSmoothingEnabled = true;
+      iCtx.clearRect(0, 0, S, S);
+      iCtx.drawImage(this._imgCanvas, roiRect.x, roiRect.y, roiRect.w, roiRect.h, 0, 0, S, S);
+      var iData = iCtx.getImageData(0, 0, S, S).data;
+      imgArr = new Float32Array(3 * n);
+      for (var i = 0; i < n; i++) {
+        imgArr[0 * n + i] = iData[i * 4 + 0] / 255;
+        imgArr[1 * n + i] = iData[i * 4 + 1] / 255;
+        imgArr[2 * n + i] = iData[i * 4 + 2] / 255;
+      }
+
+      var mCtx = this._maskSmallCtx;
+      mCtx.imageSmoothingEnabled = false;
+      mCtx.clearRect(0, 0, S, S);
+      mCtx.drawImage(this._maskCanvas, roiRect.x, roiRect.y, roiRect.w, roiRect.h, 0, 0, S, S);
+      var mData = mCtx.getImageData(0, 0, S, S).data;
+      maskF32 = new Float32Array(n);
+      for (var j = 0; j < n; j++) {
+        maskF32[j] = mData[j * 4 + 3] > 10 ? 1.0 : 0.0;
+      }
+    } else {
+      if (!this._cachedImgArr) this._rebuildImageCache();
+      imgArr = this._cachedImgArr.slice();  // detach for zero-copy transfer
+
+      var mCtx2 = this._maskSmallCtx;
+      mCtx2.imageSmoothingEnabled = false;
+      mCtx2.clearRect(0, 0, S, S);
+      mCtx2.drawImage(this._maskCanvas, 0, 0, S, S);
+      var mData2 = mCtx2.getImageData(0, 0, S, S).data;
+      maskF32 = new Float32Array(n);
+      var ones = 0;
+      for (var j2 = 0; j2 < n; j2++) {
+        var v2 = mData2[j2 * 4 + 3] > 10 ? 1.0 : 0.0;
+        maskF32[j2] = v2;
+        if (v2) ones++;
+      }
+      if (!ones) return Promise.reject(new Error('Mask is empty — draw on the image first'));
+    }
+
+    if (profile) profile.prepMs = performance.now() - profile.t0;
 
     // Encode to fp16 for transfer if requested
     var sendImg, sendMask, dtype;
@@ -685,6 +814,8 @@
       dtype    = 'float32';
     }
 
+    if (profile) profile.encodeMs = performance.now() - profile.t0 - (profile.prepMs || 0);
+
     // Push undo snapshot (capped)
     var snap = this._imgCtx.getImageData(0, 0, this._imgCanvas.width, this._imgCanvas.height);
     if (this._undoStack.length >= this._undoLimit) this._undoStack.shift();
@@ -695,11 +826,20 @@
     return new Promise(function (resolve, reject) {
       self._pendingResolve = resolve;
       self._pendingReject  = reject;
+      self._lastRunInfo = { roiRect: roiRect, size: S };
+      if (profile) {
+        profile.size = S;
+        profile.roi = !!roiRect;
+        profile.roiRect = roiRect;
+        self._lastProfile = profile;
+      } else {
+        self._lastProfile = null;
+      }
       // imgArr は slice() 済みの独立バッファ、maskArr も新規作成 → 両方 transfer 可
       var imgBuf  = sendImg.buffer;
       var maskBuf = sendMask.buffer;
       self._worker.postMessage(
-        { type: 'run', imgArr: imgBuf, maskArr: maskBuf, dtype: dtype },
+        { type: 'run', imgArr: imgBuf, maskArr: maskBuf, dtype: dtype, size: S },
         [imgBuf, maskBuf]
       );
       // transfer 後に _cachedImgArr が detach されないよう null にして次回再構築を強制

@@ -165,7 +165,7 @@ section:nth-child(8){animation-delay:.35s} section:nth-child(9){animation-delay:
 'use strict';
 var ORT_CDN = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js';
 var session = null;
-var IMG_SIZE = 512;
+var IMG_SIZE = 256;
 function post(type,extra){ self.postMessage(Object.assign({type:type},extra||{})); }
 
 // IndexedDB cache
@@ -191,6 +191,7 @@ async function init(msg){
     importScripts(ORT_CDN);
     post('status',{state:'busy',text:'onnxruntime-web 読み込み完了'});
     var buf=await fetchModel(msg.modelUrl);
+    IMG_SIZE = msg.imgSize || IMG_SIZE;
     post('progress',{pct:95,label:'セッション初期化中…'});
     var eps=['wasm'];
     if(msg.preferWebGPU){try{if(navigator.gpu||typeof GPUAdapter!=='undefined') eps=['webgpu','wasm'];}catch(e){}}
@@ -217,7 +218,7 @@ function decodeF16(u16){
 
 async function run(msg){
   try{
-    var S=IMG_SIZE, isF16=(msg.dtype==='float16');
+    var S=msg.size||IMG_SIZE, isF16=(msg.dtype==='float16');
     var imgF32  = isF16 ? decodeF16(new Uint16Array(msg.imgArr))  : new Float32Array(msg.imgArr);
     var maskF32 = isF16 ? decodeF16(new Uint16Array(msg.maskArr)) : new Float32Array(msg.maskArr);
     var imgT =new ort.Tensor('float32',imgF32, [1,3,S,S]);
@@ -249,7 +250,8 @@ self.onmessage=function(e){var m=e.data;if(m.type==='init')init(m);if(m.type==='
 </script>
 
 <!-- Library -->
-<script src="nezumi-inpaint.js"></script>
+<!-- Library (static) -->
+<script src="./nezumi-inpaint.js"></script>
 
 <div class="page-grid">
 
@@ -368,7 +370,7 @@ self.onmessage=function(e){var m=e.data;if(m.type==='init')init(m);if(m.type==='
       <tbody>
         <tr><td>ゼロ依存</td><td>ONNX Runtime Web CDN から自動取得</td></tr>
         <tr><td>Float32 / Float16</td><td><code>dtype:'float16'</code> で転送量を半減</td></tr>
-        <tr><td>imgSize 可変</td><td>256 / 512 / 768 / 1024 から最近値へ自動スナップ</td></tr>
+        <tr><td>imgSize 可変</td><td>128 / 256 / 512 / 768 / 1024 から最近値へ自動スナップ</td></tr>
         <tr><td>UMD</td><td>ESM / CJS / グローバルすべて対応</td></tr>
         <tr><td>Promise API</td><td><code>loadImage()</code> / <code>run()</code> は Promise を返す</td></tr>
         <tr><td>Undo スタック</td><td>上限付き（デフォルト 20）</td></tr>
@@ -440,7 +442,12 @@ inpainter.<span class="fn">download</span>();</code></pre>
       <thead><tr><th>オプション</th><th>型</th><th>デフォルト</th><th>説明</th></tr></thead>
       <tbody>
         <tr><td>dtype</td><td>'float32' | 'float16'</td><td><span class="default-val">'float32'</span></td><td>fp16 で転送量半減。Native Float16Array (Chrome 120+) または pure-JS エンコーダを使用。</td></tr>
-        <tr><td>imgSize</td><td>number</td><td><span class="default-val">512</span></td><td>256 / 512 / 768 / 1024 の最近値へスナップ。コンストラクタ時のみ設定可。</td></tr>
+        <tr><td>imgSize</td><td>number</td><td><span class="default-val">256</span></td><td>128 / 256 / 512 / 768 / 1024 の最近値へスナップ。コンストラクタ時のみ設定可。</td></tr>
+        <tr><td>roi</td><td>boolean</td><td><span class="default-val">false</span></td><td>マスクのバウンディングボックスを ROI として推論。</td></tr>
+        <tr><td>roiPad</td><td>number</td><td><span class="default-val">128</span></td><td>ROI に追加する余白 (px)。</td></tr>
+        <tr><td>roiMinSize</td><td>number</td><td><span class="default-val">256</span></td><td>ROI 推論サイズの最小値。</td></tr>
+        <tr><td>roiMaxSize</td><td>number</td><td><span class="default-val">imgSize</span></td><td>ROI 推論サイズの最大値。</td></tr>
+        <tr><td>profile</td><td>boolean</td><td><span class="default-val">false</span></td><td>前処理や推論の計測を有効化。</td></tr>
       </tbody>
     </table>
 
@@ -450,7 +457,8 @@ inpainter.<span class="fn">download</span>();</code></pre>
       <tbody>
         <tr><td>onStatus</td><td><code>{ state, text }</code></td><td>state: 'ok' / 'busy' / 'err'</td></tr>
         <tr><td>onProgress</td><td><code>{ pct, label }</code></td><td>0〜100</td></tr>
-        <tr><td>onResult</td><td><code>{ elapsedMs, ep }</code></td><td>推論完了時</td></tr>
+        <tr><td>onResult</td><td><code>{ elapsedMs, ep, profile }</code></td><td>推論完了時</td></tr>
+        <tr><td>onProfile</td><td><code>{ totalMs, inferMs, prepMs, size, roi }</code></td><td>profile 有効時の計測結果</td></tr>
         <tr><td>onError</td><td><code>message: string</code></td><td>エラー時</td></tr>
       </tbody>
     </table>
@@ -619,6 +627,8 @@ function createInpainter(dtype) {
     container: '#demoWrap',
     dtype:     dtype,
     brushSize: parseInt(brushSlider.value),
+    roi:       true,
+    profile:   true,
 
     onStatus: function(s) {
       statusDot.className = 'dot ' + s.state;
@@ -630,7 +640,7 @@ function createInpainter(dtype) {
       progressFill.style.width = p.pct + '%';
       progressLabel.textContent = p.label;
     },
-    onResult: function() { btnRun.disabled = false; },
+    onResult: function(r) { btnRun.disabled = false; if (window.NEZUMI_DEBUG && r && r.profile) console.log('[profile]', r.profile); },
     onError:  function() { btnRun.disabled = false; }
   });
 
